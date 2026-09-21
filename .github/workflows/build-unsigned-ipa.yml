@@ -1,0 +1,129 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Hydrate's app target requires iOS 27 / Xcode 27.
+    runs-on: xcode-27
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify Xcode and iOS SDK
+        run: |
+          set -euo pipefail
+          mkdir -p build/logs build/output
+          {
+            git rev-parse HEAD
+            xcode-select -p
+            xcodebuild -version
+            xcodebuild -showsdks
+          } 2>&1 | tee build/logs/environment.txt
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          if (( ${sdk_version%%.*} < 27 )); then
+            echo "::error::Hydrate requires the iOS 27 SDK. Select an Xcode 27 runner."
+            exit 1
+          fi
+
+      - name: Resolve pinned Swift packages
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project Hydrate.xcodeproj \
+            -scheme Hydrate \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/HydratePackages" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            2>&1 | tee build/logs/packages.log
+
+      - name: Archive for iPhone without signing
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project Hydrate.xcodeproj \
+            -scheme Hydrate \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/Hydrate.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/HydrateDerivedData" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/HydratePackages" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -resultBundlePath "$PWD/build/Archive.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            2>&1 | tee build/logs/archive.log
+
+      - name: Package and verify unsigned IPA
+        run: |
+          set -euo pipefail
+          app="$PWD/build/Hydrate.xcarchive/Products/Applications/Hydrate.app"
+          test -d "$app"
+          /usr/bin/plutil -lint "$app/Info.plist"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")"
+          xcrun lipo -verify_arch arm64 "$app/$executable"
+          platform="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms:0' "$app/Info.plist")"
+          test "$platform" = iPhoneOS
+          mkdir -p build/staging/Payload
+          /usr/bin/ditto "$app" build/staging/Payload/Hydrate.app
+          (
+            cd build/staging
+            /usr/bin/zip -qry ../output/Hydrate-unsigned.ipa Payload
+          )
+          /usr/bin/unzip -tq build/output/Hydrate-unsigned.ipa
+          cp Hydrate/Hydrate.entitlements build/output/Original.entitlements
+          cp Hydrate.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved build/output/
+          {
+            echo 'UNSIGNED: This IPA cannot be installed until it is signed for your device.'
+            echo 'Signing must cover embedded frameworks and use a matching provisioning profile.'
+            echo 'Original.entitlements is a reference, not a ready-to-use signing entitlement file.'
+            echo 'SharePlay and associated domains require compatible provisioning permissions.'
+            echo "Source commit: $(git rev-parse HEAD)"
+            echo "Minimum iOS: $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist")"
+            echo "Bundle ID: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")"
+            xcodebuild -version
+          } > build/output/BUILD-INFO.txt
+          (
+            cd build/output
+            shasum -a 256 Hydrate-unsigned.ipa > SHA256SUMS.txt
+          )
+          {
+            echo '### Unsigned IPA built'
+            echo 'Download the Hydrate-unsigned artifact below and extract the ZIP.'
+            echo 'The IPA still needs device-compatible signing before installation.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Hydrate-unsigned-${{ github.run_number }}
+          path: build/output/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs even on failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Hydrate-build-logs-${{ github.run_number }}
+          path: |
+            build/logs/
+            build/Archive.xcresult/
+          if-no-files-found: warn
+          retention-days: 7
